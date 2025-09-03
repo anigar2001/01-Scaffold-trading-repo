@@ -1,0 +1,60 @@
+services:
+  app:
+    build: .
+    env_file: .env
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+    command: ["/bin/bash","/app/docker-entrypoint.sh"]
+    ports:
+      - "127.0.0.1:8000:8000"   # FastAPI accesible solo desde localhost (Nginx proxifica)
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+  bot:
+    build: .
+    env_file: .env
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+    working_dir: /app/src/bot
+    command: ["python","paper_trading_bot.py"]
+    restart: unless-stopped
+    depends_on:
+      - app
+
+  dashboard:
+    build: .
+    environment:
+      - API_BASE=https://api.probares.com
+      - DATA_DIR=/app/data
+      - DASH_SYMBOL=BTCUSDT
+      - STREAMLIT_SERVER_ENABLE_WEBSOCKET_COMPRESSION=false
+      - STREAMLIT_SERVER_ENABLE_CORS=false
+      - STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=false
+    command: ["streamlit","run","src/dashboard/streamlit_app.py","--server.port","8501","--server.address","0.0.0.0"]
+    ports:
+      - "127.0.0.1:8501:8501"            # Dashboard solo en localhost (Nginx proxifica)
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+    restart: unless-stopped
+    depends_on:
+      - app
+
+  trainer:
+    build: .
+    env_file: .env
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./scripts:/app/scripts
+    command: ["bash","-lc","while true; do /app/scripts/daily_train.sh; sleep 86400; done"]
+    restart: unless-stopped
+    depends_on:
+      - app
+
+  redis:
+    image: redis:7
+    restart: unless-stopped

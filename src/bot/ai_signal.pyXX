@@ -1,0 +1,87 @@
+# src/bot/ai_signal.py
+
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+import joblib
+import os
+import numpy as np
+
+MODEL_FILE = "/app/data/ai_signal_model.pkl"
+SCALER_FILE = "/app/data/scaler.pkl"
+
+class AISignal:
+    def __init__(self):
+        # Cargar modelo si existe, si no inicializar None
+        if os.path.exists(MODEL_FILE) and os.path.exists(SCALER_FILE):
+            self.model = joblib.load(MODEL_FILE)
+            self.scaler = joblib.load(SCALER_FILE)
+        else:
+            self.model = None
+            self.scaler = None
+
+    def train_model(self, df: pd.DataFrame):
+        """
+        Entrena un modelo simple de RandomForest para predecir señal:
+        1 = sube, 0 = baja
+        """
+        df = df.copy()
+        df['future_close'] = df['close'].shift(-1)
+        df['signal'] = (df['future_close'] > df['close']).astype(int)
+        df.dropna(inplace=True)
+
+        df['hl'] = df['high'] - df['low']
+        df['oc'] = df['open'] - df['close']
+        X = df[['close', 'hl', 'oc', 'volume']].values
+        y = df['signal'].values
+
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(X)
+
+        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+        self.model.fit(X_scaled, y)
+
+        # Guardar modelo y scaler
+        joblib.dump(self.model, MODEL_FILE)
+        joblib.dump(self.scaler, SCALER_FILE)
+
+    def predict_signal(self, df: pd.DataFrame):
+        """
+        Devuelve dict con:
+        - 'signal': 'buy', 'sell' o 'hold'
+        - 'confidence': probabilidad en %
+        - 'last_price': último precio de cierre
+        """
+        if self.model is None or self.scaler is None:
+            return {"signal": "hold", "confidence": 0.0, "last_price": None}
+
+        df = df.copy()
+        df['hl'] = df['high'] - df['low']
+        df['oc'] = df['open'] - df['close']
+        X = df[['close', 'hl', 'oc', 'volume']].values
+        X_scaled = self.scaler.transform(X)
+
+        # Probabilidades
+        probs = self.model.predict_proba(X_scaled)[-1]  # última fila
+        last_pred = self.model.predict(X_scaled)[-1]
+
+        # Interpretación de señal
+        if last_pred == 1:
+            signal = "buy"
+            confidence = round(probs[1] * 100, 2)
+        else:
+            signal = "sell"
+            confidence = round(probs[0] * 100, 2)
+
+        # Se puede incluir 'hold' si la probabilidad no supera un umbral, por ejemplo 55%
+        threshold = 55
+        if confidence < threshold:
+            signal = "hold"
+
+        last_price = df['close'].iloc[-1]
+
+        return {
+            "signal": signal,
+            "confidence": confidence,
+            "last_price": last_price
+        }
