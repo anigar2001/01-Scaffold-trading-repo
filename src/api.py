@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+import numpy as np
 
 load_dotenv()
 
@@ -91,7 +92,13 @@ def get_rl_agent() -> MultimodalRLAgent:
 # -----------------------
 ALLOWED_TFS = {"1m", "5m", "15m", "1h"}
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+
+# --- ENV RL (añade si faltan) ---
+RL_STEP_MIN = int(os.getenv("RL_STEP_MIN", 15))
+RL_LOOKBACK = int(os.getenv("RL_LOOKBACK", 32))
+RL_THETA = float(os.getenv("RL_THETA", 0.05))
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+MULTIMODAL_RL_FILE = os.getenv("MULTIMODAL_RL_FILE", os.path.join(DATA_DIR, "multimodal_rl.zip"))
 LOGS_DIR = Path(os.getenv("LOGS_DIR", "/app/logs"))
 JOBS_DIR = DATA_DIR / "train_jobs"
 for p in (LOGS_DIR, JOBS_DIR):
@@ -291,7 +298,45 @@ class RLActionResp(BaseModel):
     positions_hist: Optional[List[int]] = None
     meta: Dict[str, Any]
 
+# --- Request model ---
+class MultimodalActionRequest(BaseModel):
+    symbols: List[str]
+    price_window: List[List[float]]  # lista por símbolo (usamos [0])
+    sentiment: Optional[float] = 0.0
 
+# --- Helpers ---
+def _r1m_from_prices(prices: List[float]) -> np.ndarray:
+    p = np.asarray(prices, dtype=np.float64)
+    if p.ndim != 1 or p.size < 3:
+        return np.array([], dtype=np.float64)
+    return np.diff(np.log(p))
+
+def _agg_returns(r1m: np.ndarray, step: int) -> np.ndarray:
+    # rolling-sum tipo 15m a partir de 1m
+    if r1m.size < step:
+        return np.array([], dtype=np.float64)
+    kernel = np.ones(step, dtype=np.float64)
+    return np.convolve(r1m, kernel, mode="valid")
+
+def _zscore(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    mu = np.mean(x) if x.size else 0.0
+    sd = np.std(x) if x.size else 1.0
+    if not np.isfinite(sd) or sd < 1e-8:
+        sd = 1.0
+    return (x - mu) / sd
+
+_RL_MODEL = None
+def _get_rl_model():
+    global _RL_MODEL
+    if _RL_MODEL is not None:
+        return _RL_MODEL, None
+    try:
+        from stable_baselines3 import PPO  # u otro algoritmo
+        _RL_MODEL = PPO.load(MULTIMODAL_RL_FILE, device="cpu")
+        return _RL_MODEL, None
+    except Exception as e:
+        return None, str(e)    
 # -----------------------
 # Endpoints base
 # -----------------------
@@ -442,17 +487,93 @@ def post_signal_stockformer(payload: StockformerFeatures):
     )
 
 
-@app.post("/agent/multimodal/action", response_model=RLActionResp)
-def post_multimodal_action(state: MultimodalState):
-    agent = get_rl_agent()
-    out = agent.act(state.dict())
-    return RLActionResp(
-        symbols=out.symbols,
-        action=out.action,
-        equity_curve=out.equity_curve,
-        positions_hist=out.positions_hist,
-        meta=out.meta,
-    )
+@app.post("/agent/multimodal/action")
+def multimodal_action(req: MultimodalActionRequest):
+    try:
+        if not req.price_window or not req.price_window[0]:
+            raise HTTPException(status_code=400, detail="price_window vacío")
+
+        prices = req.price_window[0]
+        r1m = _r1m_from_prices(prices)
+        r_step = _agg_returns(r1m, RL_STEP_MIN)
+
+        min_len = RL_LOOKBACK + 1
+        if r_step.size < min_len:
+            if r_step.size == 0:
+                r_step = np.zeros(min_len, dtype=np.float64)
+            else:
+                pad = min_len - r_step.size
+                r_step = np.concatenate([np.full(pad, r_step[0]), r_step])
+
+        x = _zscore(r_step)[-RL_LOOKBACK:]
+        sentiment = float(req.sentiment or 0.0)
+        obs = np.concatenate([x, [sentiment]]).reshape(1, -1)
+
+        model, err = _get_rl_model()
+        mock = model is None
+        if mock:
+            a_curr = float(np.tanh(obs.sum()))
+        else:
+            a_curr = float(np.clip(model.predict(obs, deterministic=True)[0], -1.0, 1.0))
+
+        K = int(min(128, r_step.size))
+        actions_hist = []
+
+        if mock:
+            actions_hist = [a_curr] * K
+        else:
+            for i in range(-K, 0):
+                end = r_step.size + i
+                start = end - RL_LOOKBACK
+                if start < 0:
+                    continue
+                x_i = _zscore(r_step[start:end])
+                o_i = np.concatenate([x_i, [sentiment]]).reshape(1, -1)
+                a_i = float(np.clip(model.predict(o_i, deterministic=True)[0], -1.0, 1.0))
+                actions_hist.append(a_i)
+            if not actions_hist:
+                actions_hist = [a_curr] * K
+
+        actions_hist = np.asarray(actions_hist, dtype=np.float64)
+        positions_hist = np.where(
+            actions_hist > RL_THETA, 1,
+            np.where(actions_hist < -RL_THETA, -1, 0)
+        ).astype(int).tolist()
+
+        r_sim = r_step[-len(positions_hist):]
+        eq = [1.0]
+        for i, ret in enumerate(r_sim):
+            pos = positions_hist[i]
+            eq.append(eq[-1] * (1.0 + pos * float(ret)))
+        equity_curve = eq
+
+        meta = {
+            "backend": "sb3" if not mock else "mock",
+            "mock": mock,
+            "theta": RL_THETA,
+            "lookback": RL_LOOKBACK,
+            "step_min": RL_STEP_MIN,
+            "model_path": MULTIMODAL_RL_FILE,
+            "obs_dim": int(obs.shape[1]),
+            "scaling": "returns_step_norm",
+            "action_stats": {
+                "min": float(np.min(actions_hist)),
+                "mean": float(np.mean(actions_hist)),
+                "max": float(np.max(actions_hist)),
+            },
+        }
+
+        return {
+            "symbols": req.symbols,
+            "action": [a_curr],
+            "positions_hist": positions_hist,
+            "equity_curve": equity_curve,
+            "meta": meta,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # -----------------------
