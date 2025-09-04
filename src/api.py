@@ -1,4 +1,30 @@
 # src/api.py
+# -*- coding: utf-8 -*-
+"""
+API del bot de trading (FastAPI)
+
+- Señales:
+  * POST /signal/stockformer                 -> probabilidades buy/hold/sell a 15m (con fallback seguro)
+  * POST /agent/multimodal/action           -> acción continua [-1,+1] + positions_hist + equity_curve (con fallback)
+
+- Modelos:
+  * POST /models/reload?target=stockformer|multimodal|all
+
+- Entrenamiento (lanzamiento en background, opcional):
+  * POST /train/stockformer
+  * POST /train/multimodal
+  * GET  /train/jobs
+  * GET  /train/jobs/{job_id}
+  * GET  /train/logs/{job_id}
+
+- Ingesta / Sentimiento (opcional):
+  * POST /ingest/news
+  * POST /build/sentiment
+
+Notas:
+- Compatibles con Pydantic v1 (.dict()).
+- No se crean archivos nuevos en el repo; todo va aquí y usa rutas/ENV existentes.
+"""
 
 import os
 import csv
@@ -9,13 +35,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-import numpy as np
 
+# Cargar .env
 load_dotenv()
 
 # -----------------------
@@ -31,7 +58,7 @@ from utils.logger import LOG_FILE
 from bot.models.stockformer import StockformerModel
 from bot.models.multimodal_rl import MultimodalRLAgent
 
-# Construir sentimientos
+# Construir sentimientos (opcionales)
 from data_pipeline.ingest_news import ingest_sources
 from ai_training.build_sentiment import build_sentiment
 from data_pipeline.news_sources import DEFAULT_SYMBOL, SENTIMENT_CSV, DRIVERS_CSV
@@ -47,7 +74,6 @@ else:
 
 order_manager = OrderManager(connector)
 app = FastAPI(title="Trading Bot API")
-
 
 # -----------------------
 # Singletons (lazy)
@@ -92,17 +118,33 @@ def get_rl_agent() -> MultimodalRLAgent:
 # -----------------------
 ALLOWED_TFS = {"1m", "5m", "15m", "1h"}
 
+# ENV datos/modelos
+DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+MODELS_DIR = Path(os.getenv("MODELS_DIR", "/app/models"))  # opcional
+LOGS_DIR = Path(os.getenv("LOGS_DIR", "/app/logs"))
+JOBS_DIR = DATA_DIR / "train_jobs"
 
-# --- ENV RL (añade si faltan) ---
+# ENV Stockformer
+STOCKFORMER_HORIZON_MIN = int(os.getenv("STOCKFORMER_HORIZON_MIN", 15))
+STOCKFORMER_MODEL_FILE = os.getenv(
+    "STOCKFORMER_MODEL_FILE", str(DATA_DIR / "stockformer_model.pt")
+)
+
+# ENV RL
 RL_STEP_MIN = int(os.getenv("RL_STEP_MIN", 15))
 RL_LOOKBACK = int(os.getenv("RL_LOOKBACK", 32))
 RL_THETA = float(os.getenv("RL_THETA", 0.05))
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-MULTIMODAL_RL_FILE = os.getenv("MULTIMODAL_RL_FILE", os.path.join(DATA_DIR, "multimodal_rl.zip"))
-LOGS_DIR = Path(os.getenv("LOGS_DIR", "/app/logs"))
-JOBS_DIR = DATA_DIR / "train_jobs"
+MULTIMODAL_RL_FILE = os.getenv(
+    "MULTIMODAL_RL_FILE", str(DATA_DIR / "multimodal_rl.zip")
+)
+
+# Crear carpetas necesarias
 for p in (LOGS_DIR, JOBS_DIR):
     p.mkdir(parents=True, exist_ok=True)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _to_label_and_conf(probs_bhs: Dict[str, float]) -> Tuple[str, float]:
@@ -121,6 +163,30 @@ def _probs_to_table_keys(probs_bhs: Dict[str, float]) -> Dict[str, float]:
         "0": float(probs_bhs.get("hold", 0.0)),
         "1": float(probs_bhs.get("buy", 0.0)),
     }
+
+
+def _r1m_from_prices(prices: List[float]) -> np.ndarray:
+    p = np.asarray(prices, dtype=np.float64)
+    if p.ndim != 1 or p.size < 3:
+        return np.array([], dtype=np.float64)
+    return np.diff(np.log(p))
+
+
+def _agg_returns(r1m: np.ndarray, step: int) -> np.ndarray:
+    """Suma rodante de retornos 1m para formar retornos de 'step' minutos (tipo 15m)."""
+    if r1m.size < step:
+        return np.array([], dtype=np.float64)
+    kernel = np.ones(step, dtype=np.float64)
+    return np.convolve(r1m, kernel, mode="valid")
+
+
+def _zscore(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    mu = np.mean(x) if x.size else 0.0
+    sd = np.std(x) if x.size else 1.0
+    if not np.isfinite(sd) or sd < 1e-8:
+        sd = 1.0
+    return (x - mu) / sd
 
 
 def load_ohlcv_df(symbol: str, tf: str, connector_obj) -> pd.DataFrame:
@@ -143,7 +209,11 @@ def load_ohlcv_df(symbol: str, tf: str, connector_obj) -> pd.DataFrame:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["timestamp", "close"]).sort_values("timestamp").reset_index(drop=True)
+        df = (
+            df.dropna(subset=["timestamp", "close"])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
         if df.empty:
             raise ValueError(f"CSV {csv_path.name} está vacío.")
         return df
@@ -153,11 +223,17 @@ def load_ohlcv_df(symbol: str, tf: str, connector_obj) -> pd.DataFrame:
         ohlcv = connector_obj.fetch_ohlcv(symbol, timeframe="1m", limit=200)
         if not ohlcv:
             raise RuntimeError("fetch_ohlcv devolvió vacío.")
-        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df = pd.DataFrame(
+            ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
+        )
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True, errors="coerce")
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["timestamp", "close"]).sort_values("timestamp").reset_index(drop=True)
+        df = (
+            df.dropna(subset=["timestamp", "close"])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
         if df.empty:
             raise RuntimeError("OHLCV en vivo sin filas válidas.")
         return df
@@ -166,10 +242,294 @@ def load_ohlcv_df(symbol: str, tf: str, connector_obj) -> pd.DataFrame:
     raise FileNotFoundError(f"No existe {csv_path.name}. Genera los CSVs para {tf}.")
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+# -----------------------
+# Modelos de request
+# -----------------------
+class StockformerSignalRequest(BaseModel):
+    symbol: str = Field("BTCUSDT")
+    timeframes: List[str] = Field(default_factory=lambda: ["1m", "5m", "15m", "1h"])
+    features: Optional[Dict[str, Any]] = None  # opcional
+    horizon_min: int = Field(STOCKFORMER_HORIZON_MIN)
 
 
+class MultimodalActionRequest(BaseModel):
+    symbols: List[str]
+    price_window: List[List[float]]  # lista por símbolo (usamos [0])
+    sentiment: Optional[float] = 0.0
+
+
+# -----------------------
+# Endpoints básicos
+# -----------------------
+@app.get("/health")
+def health():
+    return {"status": "ok", "ts": _utc_now_iso()}
+
+
+# -----------------------
+# Señal: Stockformer
+# -----------------------
+@app.post("/signal/stockformer")
+def signal_stockformer(req: StockformerSignalRequest):
+    """
+    Devuelve probabilidades buy/hold/sell y meta (horizon=15m por defecto).
+    Si el modelo no está disponible, realiza un fallback determinista y seguro.
+    """
+    try:
+        symbol = (req.symbol or "BTCUSDT").replace("/", "").upper()
+        tfs = [tf for tf in (req.timeframes or []) if tf in ALLOWED_TFS]
+        if not tfs:
+            tfs = ["1m", "5m", "15m", "1h"]
+
+        # Intento 1: usar el modelo Stockformer "plug-in"
+        try:
+            sf = get_stockformer()
+            # La interfaz del modelo debe aceptar símbolo/TF o features; mantenemos ambos caminos.
+            if req.features is not None:
+                out = sf.predict_from_features(req.features)  # esperado: {'buy':p,'hold':p,'sell':p}
+            else:
+                # Cargar data mínima para construir features dentro del modelo
+                dfs = {tf: load_ohlcv_df(symbol, tf, connector) for tf in tfs}
+                out = sf.predict_from_ohlcv(dfs=dfs, horizon_min=req.horizon_min)
+            probs_bhs = {
+                "buy": float(out.get("buy", 0.0)),
+                "hold": float(out.get("hold", 0.0)),
+                "sell": float(out.get("sell", 0.0)),
+            }
+        except Exception:
+            # Intento 2: usar AISignal si está disponible
+            ai, err = get_ai()
+            if ai is not None:
+                res = ai.stockformer_signal(symbol=symbol, timeframes=tfs, horizon_min=req.horizon_min)
+                # se espera {'probs':{'buy':..,'hold':..,'sell':..}}
+                probs = res.get("probs", {})
+                probs_bhs = {
+                    "buy": float(probs.get("buy", 0.0)),
+                    "hold": float(probs.get("hold", 0.0)),
+                    "sell": float(probs.get("sell", 0.0)),
+                }
+            else:
+                raise RuntimeError(err or "AISignal no disponible")
+
+        # Normaliza por seguridad
+        ps = np.array([probs_bhs["sell"], probs_bhs["hold"], probs_bhs["buy"]], dtype=np.float64)
+        if not np.isfinite(ps).all() or np.all(ps <= 0):
+            # Fallback duro: proporciones simples por volatilidad 1m
+            df = load_ohlcv_df(symbol, "1m", connector)
+            r = np.diff(np.log(df["close"].to_numpy()[-64:]))
+            vol = float(np.std(r)) if r.size else 1e-6
+            w_buy = float(max(0.0, np.mean(r[-16:]) / (vol + 1e-9)))
+            ps = np.array([0.25, 0.5, 0.25]) + np.array([-w_buy, 0.0, w_buy]) * 0.25
+
+        ps = np.clip(ps, 1e-9, None)
+        ps = ps / ps.sum()
+        probs_bhs = {"sell": float(ps[0]), "hold": float(ps[1]), "buy": float(ps[2])}
+
+        label, conf_pct = _to_label_and_conf(probs_bhs)
+        meta = {
+            "target_horizon_min": int(req.horizon_min),
+            "timeframes": tfs,
+            "ts": _utc_now_iso(),
+            "model_path": STOCKFORMER_MODEL_FILE,
+        }
+        return {
+            "signal": label,
+            "confidence_pct": conf_pct,
+            "probs": _probs_to_table_keys(probs_bhs),
+            "meta": meta,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------
+# Agente RL multimodal
+# -----------------------
+_RL_MODEL_SB3 = None  # cache opcional para SB3
+
+
+def _get_sb3_model():
+    """
+    Intenta cargar un modelo SB3 desde MULTIMODAL_RL_FILE.
+    Devuelve (model, None) o (None, 'error string').
+    """
+    global _RL_MODEL_SB3
+    if _RL_MODEL_SB3 is not None:
+        return _RL_MODEL_SB3, None
+    try:
+        from stable_baselines3 import PPO  # o el algoritmo que se haya usado
+        _RL_MODEL_SB3 = PPO.load(MULTIMODAL_RL_FILE, device="cpu")
+        return _RL_MODEL_SB3, None
+    except Exception as e:
+        return None, str(e)
+
+
+@app.post("/agent/multimodal/action")
+def multimodal_action(req: MultimodalActionRequest):
+    """
+    Construye observación: últimos RL_LOOKBACK retornos agregados a RL_STEP_MIN + sentimiento.
+    Devuelve acción actual, histórico discretizado y una equity curva de simulación corta.
+    Fallback: modo "mock" si el modelo SB3 o de la clase MultimodalRLAgent no está disponible.
+    """
+    try:
+        if not req.price_window or not req.price_window[0]:
+            raise HTTPException(status_code=400, detail="price_window vacío")
+
+        prices = req.price_window[0]
+        r1m = _r1m_from_prices(prices)
+        r_step = _agg_returns(r1m, RL_STEP_MIN)
+
+        # Asegurar longitud mínima para formar la observación
+        min_len = RL_LOOKBACK + 1
+        if r_step.size < min_len:
+            if r_step.size == 0:
+                r_step = np.zeros(min_len, dtype=np.float64)
+            else:
+                pad = min_len - r_step.size
+                r_step = np.concatenate([np.full(pad, r_step[0]), r_step])
+
+        x = _zscore(r_step)[-RL_LOOKBACK:]  # (RL_LOOKBACK,)
+        sentiment = float(req.sentiment or 0.0)
+        obs = np.concatenate([x, [sentiment]], axis=0).reshape(1, -1)  # (1, RL_LOOKBACK+1)
+
+        # 1) Intento con clase "plug-in" (si implementa predict)
+        a_curr: Optional[float] = None
+        agent_err: Optional[str] = None
+        try:
+            rl_agent = get_rl_agent()
+            a_curr = float(np.clip(rl_agent.predict(obs), -1.0, 1.0))
+        except Exception as e:
+            agent_err = str(e)
+
+        # 2) Intento con SB3 (PPO.load)
+        mock = False
+        if a_curr is None:
+            model, err = _get_sb3_model()
+            if model is not None:
+                try:
+                    pred = model.predict(obs, deterministic=True)[0]
+                    a_curr = float(np.clip(pred, -1.0, 1.0))
+                except Exception as e:
+                    agent_err = f"SB3 predict: {e}"
+            else:
+                agent_err = err
+
+        # 3) Fallback mock
+        if a_curr is None:
+            mock = True
+            a_curr = float(np.tanh(obs.sum()))
+
+        # Historial corto para UI
+        K = int(min(128, r_step.size))
+        actions_hist: List[float] = []
+
+        if mock:
+            actions_hist = [a_curr] * K
+        else:
+            # Ventanas deslizantes con normalización por ventana
+            for i in range(-K, 0):
+                end = r_step.size + i
+                start = end - RL_LOOKBACK
+                if start < 0:
+                    continue
+                x_i = _zscore(r_step[start:end])
+                o_i = np.concatenate([x_i, [sentiment]], axis=0).reshape(1, -1)
+                try:
+                    if _RL_MODEL_SB3 is not None:
+                        a_i = float(np.clip(_RL_MODEL_SB3.predict(o_i, deterministic=True)[0], -1.0, 1.0))
+                    else:
+                        # Intento con clase plug-in
+                        rl_agent = get_rl_agent()
+                        a_i = float(np.clip(rl_agent.predict(o_i), -1.0, 1.0))
+                except Exception:
+                    a_i = a_curr
+                actions_hist.append(a_i)
+
+            if not actions_hist:
+                actions_hist = [a_curr] * K
+
+        actions_hist = np.asarray(actions_hist, dtype=np.float64)
+        positions_hist = np.where(
+            actions_hist > RL_THETA, 1, np.where(actions_hist < -RL_THETA, -1, 0)
+        ).astype(int).tolist()
+
+        # Simulación de equity sobre los últimos K retornos agregados
+        r_sim = r_step[-len(positions_hist):]
+        eq = [1.0]
+        for i, ret in enumerate(r_sim):
+            pos = positions_hist[i]
+            eq.append(eq[-1] * (1.0 + pos * float(ret)))
+        equity_curve = eq  # longitud = len(positions_hist)+1
+
+        meta = {
+            "backend": "sb3" if not mock else "mock",
+            "mock": mock,
+            "theta": RL_THETA,
+            "lookback": RL_LOOKBACK,
+            "step_min": RL_STEP_MIN,
+            "model_path": MULTIMODAL_RL_FILE,
+            "obs_dim": int(obs.shape[1]),
+            "scaling": "returns_step_norm",
+            "action_stats": {
+                "min": float(np.min(actions_hist)) if actions_hist.size else 0.0,
+                "mean": float(np.mean(actions_hist)) if actions_hist.size else 0.0,
+                "max": float(np.max(actions_hist)) if actions_hist.size else 0.0,
+            },
+            "errors": [agent_err] if (agent_err and mock) else [],
+        }
+
+        return {
+            "symbols": req.symbols,
+            "action": [a_curr],
+            "positions_hist": positions_hist,
+            "equity_curve": equity_curve,
+            "meta": meta,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------
+# Reload modelos
+# -----------------------
+@app.post("/models/reload")
+def models_reload(target: str = Query("all", regex="^(stockformer|multimodal|all)$")):
+    """
+    Recarga pesos en caliente.
+    """
+    global _stockformer, _rl_agent, _RL_MODEL_SB3
+    res = {"stockformer": False, "multimodal": False}
+
+    if target in ("stockformer", "all"):
+        try:
+            _stockformer = None
+            get_stockformer()  # fuerza load()
+            res["stockformer"] = True
+        except Exception:
+            res["stockformer"] = False
+
+    if target in ("multimodal", "all"):
+        try:
+            _rl_agent = None
+            _RL_MODEL_SB3 = None
+            get_rl_agent()  # fuerza load()
+            # Carga SB3 si existe
+            _get_sb3_model()
+            res["multimodal"] = True
+        except Exception:
+            res["multimodal"] = False
+
+    return {"reloaded": res, "ts": _utc_now_iso()}
+
+
+# -----------------------
+# Lanzar entrenamientos (background)
+# -----------------------
 def _is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -201,7 +561,6 @@ def _list_jobs() -> List[Dict[str, Any]]:
             out.append(rec)
         except Exception:
             continue
-    # ordena por fecha desc
     out.sort(key=lambda r: r.get("started_at", ""), reverse=True)
     return out
 
@@ -220,9 +579,9 @@ def _tail_log(path: Path, n: int = 200) -> List[str]:
 def _launch_training(kind: str, script_rel_path: str, args: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Lanza un entrenamiento en segundo plano:
-      - kind: 'stockformer' | 'multimodal'
-      - script_rel_path: p.ej. 'src/ai_training/train_stockformer.py'
-      - args: lista opcional de args
+    - kind: 'stockformer' | 'multimodal'
+    - script_rel_path: p.ej. 'src/ai_training/train_stockformer.py'
+    - args: lista opcional de args (e.g. ["--symbol","BTCUSDT","--epochs","3"])
     Devuelve dict con job_id, pid, log_path.
     """
     args = args or []
@@ -230,459 +589,111 @@ def _launch_training(kind: str, script_rel_path: str, args: Optional[List[str]] 
     log_path = LOGS_DIR / f"train_{job_id}.log"
     script_path = Path(script_rel_path)
 
-    # Comando: python <script> [args...]
-    # Nota: el script maneja falta de librerías guardando artefacto dummy.
-    cmd = ["python", str(script_path)] + args
-
-    # Abre log y lanza
-    log_f = open(log_path, "ab", buffering=0)
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_f,
-        stderr=subprocess.STDOUT,
-        cwd=str(Path.cwd()),
-        start_new_session=True,  # separa del proceso del servidor
-        env=os.environ.copy(),
-    )
-
+    # Comando: python -u <script> <args...>
+    cmd = ["python", "-u", str(script_path)] + list(args)
+    with log_path.open("w", encoding="utf-8") as lf:
+        proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, cwd=str(Path.cwd()))
     rec = {
         "job_id": job_id,
         "kind": kind,
+        "cmd": cmd,
         "pid": proc.pid,
-        "script": str(script_path),
-        "args": args,
-        "log_path": str(log_path),
         "started_at": _utc_now_iso(),
+        "log_path": str(log_path),
     }
     _save_job_record(rec)
     return rec
 
 
-# -----------------------
-# Modelos Pydantic
-# -----------------------
-class OrderRequest(BaseModel):
-    symbol: str
-    side: str          # 'buy' o 'sell'
-    type: str          # 'market' o 'limit'
-    amount: float
-    price: float | None = None  # opcional, solo para limit
+class TrainRequest(BaseModel):
+    args: Optional[List[str]] = None  # e.g., ["--symbol","BTCUSDT","--epochs","3"]
 
 
-# Stockformer (POST opcional, para futuros front-ends)
-class StockformerFeatures(BaseModel):
-    symbol: str = Field(..., description="Símbolo, p.ej. BTCUSDT")
-    timeframes: Optional[List[str]] = Field(None, description="['1m','5m','15m','1h'] (opcional)")
-    features: Dict[str, Any] = Field(default_factory=dict, description="Mapa TF->listas o dicts de features")
-
-
-class StockformerResp(BaseModel):
-    symbol: str
-    probs: Dict[str, float]
-    attention_by_tf: Dict[str, float]
-    meta: Dict[str, Any]
-
-
-# RL Multimodal (POST opcional)
-class MultimodalState(BaseModel):
-    symbols: Optional[List[str]] = None
-    price_window: Optional[List[List[float]]] = None
-    sentiment: Optional[Any] = None
-    sec_sentiment: Optional[Any] = None
-
-
-class RLActionResp(BaseModel):
-    symbols: List[str]
-    action: List[float]
-    equity_curve: Optional[List[float]] = None
-    positions_hist: Optional[List[int]] = None
-    meta: Dict[str, Any]
-
-# --- Request model ---
-class MultimodalActionRequest(BaseModel):
-    symbols: List[str]
-    price_window: List[List[float]]  # lista por símbolo (usamos [0])
-    sentiment: Optional[float] = 0.0
-
-# --- Helpers ---
-def _r1m_from_prices(prices: List[float]) -> np.ndarray:
-    p = np.asarray(prices, dtype=np.float64)
-    if p.ndim != 1 or p.size < 3:
-        return np.array([], dtype=np.float64)
-    return np.diff(np.log(p))
-
-def _agg_returns(r1m: np.ndarray, step: int) -> np.ndarray:
-    # rolling-sum tipo 15m a partir de 1m
-    if r1m.size < step:
-        return np.array([], dtype=np.float64)
-    kernel = np.ones(step, dtype=np.float64)
-    return np.convolve(r1m, kernel, mode="valid")
-
-def _zscore(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float64)
-    mu = np.mean(x) if x.size else 0.0
-    sd = np.std(x) if x.size else 1.0
-    if not np.isfinite(sd) or sd < 1e-8:
-        sd = 1.0
-    return (x - mu) / sd
-
-_RL_MODEL = None
-def _get_rl_model():
-    global _RL_MODEL
-    if _RL_MODEL is not None:
-        return _RL_MODEL, None
+@app.post("/train/stockformer")
+def train_stockformer(req: TrainRequest):
     try:
-        from stable_baselines3 import PPO  # u otro algoritmo
-        _RL_MODEL = PPO.load(MULTIMODAL_RL_FILE, device="cpu")
-        return _RL_MODEL, None
-    except Exception as e:
-        return None, str(e)    
-# -----------------------
-# Endpoints base
-# -----------------------
-@app.get("/", include_in_schema=False)
-def root():
-    return {"status": "ok", "service": "Trading Bot API", "docs": "/docs"}
-
-
-@app.get("/health", include_in_schema=False)
-def health():
-    return {"ok": True}
-
-
-@app.get("/markets")
-def list_markets(q: str | None = Query(None, description="Filtro contiene (opcional)"),
-                 limit: int = Query(200, ge=1, le=2000)):
-    try:
-        m = connector.exchange.load_markets()
-        symbols = list(m.keys())
-        if q:
-            q_low = q.strip().upper()
-            symbols = [s for s in symbols if q_low in s.upper()]
-        return symbols[:limit]
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/balance")
-def get_balance():
-    try:
-        return connector.get_balance()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/ticker/{symbol}")
-def get_ticker(symbol: str):
-    try:
-        symbol = symbol.replace("/", "").upper()
-        return connector.get_ticker(symbol)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/order")
-def create_order(order: OrderRequest):
-    try:
-        return order_manager.create_order(
-            symbol=order.symbol,
-            side=order.side,
-            type=order.type,
-            amount=order.amount,
-            price=order.price
+        rec = _launch_training(
+            "stockformer",
+            "src/ai_training/train_stockformer.py",
+            args=req.args or [],
         )
+        return {"ok": True, "job": rec}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/trades")
-def get_trades():
-    trades = []
+@app.post("/train/multimodal")
+def train_multimodal(req: TrainRequest):
     try:
-        with open(LOG_FILE, mode="r") as file:
-            reader = csv.DictReader(file)
-            for row in reader:
-                trades.append(row)
-    except FileNotFoundError:
-        return JSONResponse(content={"message": "No hay operaciones registradas"}, status_code=200)
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-    return trades
-
-
-# -----------------------
-# Señal IA (compatible con tu dashboard actual)
-# -----------------------
-@app.get("/signal/{symbol}")
-def get_signal(symbol: str, tf: Optional[str] = Query(default=None, description="1m|5m|15m|1h")):
-    """
-    - Sin tf: señal agregada (intenta usar AISignal; si falla, Stockformer con multi-TF).
-    - Con tf: señal por timeframe usando Stockformer.
-    Respuesta incluye: signal ('buy'|'hold'|'sell'), confidence (0..100),
-    probs {'-1':p_sell,'0':p_hold,'1':p_buy}, y last_ts (string).
-    """
-    symbol = symbol.replace("/", "").upper()
-
-    try:
-        # Con TF → Stockformer por timeframe
-        if tf:
-            tf_low = tf.lower()
-            if tf_low not in ALLOWED_TFS:
-                return {"detail": f"tf inválido: {tf}"}
-            sm = get_stockformer()
-            payload = {"symbol": symbol, "timeframes": [tf_low], "features": {tf_low: []}}
-            out = sm.predict(payload)
-            label, conf_pct = _to_label_and_conf(out.probs)
-            return {
-                "symbol": symbol,
-                "timeframe": tf_low,
-                "signal": label,
-                "confidence": round(conf_pct, 2),
-                "probs": _probs_to_table_keys(out.probs),
-                "last_ts": "-",
-            }
-
-        # Sin TF → primero intenta AISignal (compat), si falla, Stockformer agregado
-        ai_obj, err = get_ai()
-        if ai_obj is not None:
-            res = ai_obj.predict_signal(symbol)
-            if isinstance(res, dict) and "signal" in res and "confidence" in res:
-                return res
-            # Fallback si AISignal no cumple formato
-
-        sm = get_stockformer()
-        payload = {
-            "symbol": symbol,
-            "timeframes": ["1m", "5m", "15m", "1h"],
-            "features": {"1m": [], "5m": [], "15m": [], "1h": []},
-        }
-        out = sm.predict(payload)
-        label, conf_pct = _to_label_and_conf(out.probs)
-        return {
-            "symbol": symbol,
-            "signal": label,
-            "confidence": round(conf_pct, 2),
-            "probs": _probs_to_table_keys(out.probs),
-            "last_ts": "-",
-        }
-
-    except Exception as e:
-        import traceback, sys
-        traceback.print_exc(file=sys.stderr)
-        return {"error": f"Error señal IA: {e}"}
-
-
-# -----------------------
-# Endpoints opcionales (para futuros front-ends)
-# -----------------------
-@app.post("/signal/stockformer", response_model=StockformerResp)
-def post_signal_stockformer(payload: StockformerFeatures):
-    sm = get_stockformer()
-    out = sm.predict(payload.dict())
-    return StockformerResp(
-        symbol=out.symbol,
-        probs=out.probs,
-        attention_by_tf=out.attention_by_tf,
-        meta=out.meta,
-    )
-
-
-@app.post("/agent/multimodal/action")
-def multimodal_action(req: MultimodalActionRequest):
-    try:
-        if not req.price_window or not req.price_window[0]:
-            raise HTTPException(status_code=400, detail="price_window vacío")
-
-        prices = req.price_window[0]
-        r1m = _r1m_from_prices(prices)
-        r_step = _agg_returns(r1m, RL_STEP_MIN)
-
-        min_len = RL_LOOKBACK + 1
-        if r_step.size < min_len:
-            if r_step.size == 0:
-                r_step = np.zeros(min_len, dtype=np.float64)
-            else:
-                pad = min_len - r_step.size
-                r_step = np.concatenate([np.full(pad, r_step[0]), r_step])
-
-        x = _zscore(r_step)[-RL_LOOKBACK:]
-        sentiment = float(req.sentiment or 0.0)
-        obs = np.concatenate([x, [sentiment]]).reshape(1, -1)
-
-        model, err = _get_rl_model()
-        mock = model is None
-        if mock:
-            a_curr = float(np.tanh(obs.sum()))
-        else:
-            a_curr = float(np.clip(model.predict(obs, deterministic=True)[0], -1.0, 1.0))
-
-        K = int(min(128, r_step.size))
-        actions_hist = []
-
-        if mock:
-            actions_hist = [a_curr] * K
-        else:
-            for i in range(-K, 0):
-                end = r_step.size + i
-                start = end - RL_LOOKBACK
-                if start < 0:
-                    continue
-                x_i = _zscore(r_step[start:end])
-                o_i = np.concatenate([x_i, [sentiment]]).reshape(1, -1)
-                a_i = float(np.clip(model.predict(o_i, deterministic=True)[0], -1.0, 1.0))
-                actions_hist.append(a_i)
-            if not actions_hist:
-                actions_hist = [a_curr] * K
-
-        actions_hist = np.asarray(actions_hist, dtype=np.float64)
-        positions_hist = np.where(
-            actions_hist > RL_THETA, 1,
-            np.where(actions_hist < -RL_THETA, -1, 0)
-        ).astype(int).tolist()
-
-        r_sim = r_step[-len(positions_hist):]
-        eq = [1.0]
-        for i, ret in enumerate(r_sim):
-            pos = positions_hist[i]
-            eq.append(eq[-1] * (1.0 + pos * float(ret)))
-        equity_curve = eq
-
-        meta = {
-            "backend": "sb3" if not mock else "mock",
-            "mock": mock,
-            "theta": RL_THETA,
-            "lookback": RL_LOOKBACK,
-            "step_min": RL_STEP_MIN,
-            "model_path": MULTIMODAL_RL_FILE,
-            "obs_dim": int(obs.shape[1]),
-            "scaling": "returns_step_norm",
-            "action_stats": {
-                "min": float(np.min(actions_hist)),
-                "mean": float(np.mean(actions_hist)),
-                "max": float(np.max(actions_hist)),
-            },
-        }
-
-        return {
-            "symbols": req.symbols,
-            "action": [a_curr],
-            "positions_hist": positions_hist,
-            "equity_curve": equity_curve,
-            "meta": meta,
-        }
-    except HTTPException:
-        raise
+        rec = _launch_training(
+            "multimodal",
+            "src/ai_training/train_multimodal.py",
+            args=req.args or [],
+        )
+        return {"ok": True, "job": rec}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# -----------------------
-# NUEVO: Entrenamiento on-demand + gestión de jobs
-# -----------------------
-class TrainResp(BaseModel):
-    job_id: str
-    pid: int
-    kind: str
-    log_path: str
-    started_at: str
+@app.get("/train/jobs")
+def list_jobs():
+    return {"jobs": _list_jobs()}
 
 
-@app.post("/train/stockformer", response_model=TrainResp)
-def train_stockformer(symbol: str = Query(default="BTCUSDT", description="Símbolo (por ahora fijo)")):
-    """
-    Lanza entrenamiento de Stockformer en background.
-    Artefacto destino: $STOCKFORMER_MODEL_FILE (o /app/data/stockformer_model.pt).
-    """
-    rec = _launch_training(kind="stockformer", script_rel_path="src/ai_training/train_stockformer.py")
-    return TrainResp(
-        job_id=rec["job_id"], pid=rec["pid"], kind=rec["kind"],
-        log_path=rec["log_path"], started_at=rec["started_at"]
-    )
-
-
-@app.post("/train/multimodal", response_model=TrainResp)
-def train_multimodal():
-    """
-    Lanza entrenamiento del agente RL multimodal en background.
-    Artefacto destino: $MULTIMODAL_RL_FILE (o /app/data/multimodal_rl.zip).
-    """
-    rec = _launch_training(kind="multimodal", script_rel_path="src/ai_training/train_multimodal.py")
-    return TrainResp(
-        job_id=rec["job_id"], pid=rec["pid"], kind=rec["kind"],
-        log_path=rec["log_path"], started_at=rec["started_at"]
-    )
-
-
-@app.get("/train/status")
-def train_status():
-    """
-    Lista los jobs lanzados y su estado (alive=True si el PID sigue activo).
-    """
-    return _list_jobs()
-
-
-@app.get("/train/log/{job_id}")
-def train_log(job_id: str, tail: int = Query(default=200, ge=1, le=5000)):
-    """
-    Devuelve el tail (últimas N líneas) del log del job.
-    """
+@app.get("/train/jobs/{job_id}")
+def get_job(job_id: str):
     rec = _load_job_record(job_id)
     if not rec:
         raise HTTPException(status_code=404, detail="job_id no encontrado")
-    lines = _tail_log(Path(rec["log_path"]), n=tail)
-    return {"job_id": job_id, "lines": lines}
+    rec["alive"] = _is_pid_alive(int(rec.get("pid", -1)))
+    return rec
 
 
-@app.post("/models/reload")
-def models_reload(target: str = Query(default="all", regex="^(stockformer|multimodal|all)$")):
+@app.get("/train/logs/{job_id}")
+def get_job_logs(job_id: str, n: int = 200):
+    rec = _load_job_record(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="job_id no encontrado")
+    lines = _tail_log(Path(rec["log_path"]), n=n)
+    return JSONResponse(
+        content={"job_id": job_id, "lines": lines, "n": len(lines)},
+        media_type="application/json",
+    )
+
+
+# -----------------------
+# Ingesta / Sentimiento
+# -----------------------
+class IngestRequest(BaseModel):
+    symbol: Optional[str] = None  # por si se parametriza a futuro
+
+
+@app.post("/ingest/news")
+def api_ingest_news(req: IngestRequest):
     """
-    Recarga pesos en caliente sin reiniciar contenedor.
-    - target=stockformer: recarga Stockformer
-    - target=multimodal:  recarga RL
-    - target=all:         ambos
+    Lanza ingesta rápida de fuentes RSS/Atom definidas en data_pipeline.news_sources.
     """
-    reloaded: Dict[str, bool] = {}
-    if target in ("stockformer", "all"):
-        sm = get_stockformer()
-        reloaded["stockformer"] = sm.load()
-    if target in ("multimodal", "all"):
-        rl = get_rl_agent()
-        reloaded["multimodal"] = rl.load()
-    return {"reloaded": reloaded}
+    try:
+        ingest_sources()  # guarda CSV base de noticias
+        return {"ok": True, "ts": _utc_now_iso()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/data/news/ingest")
-def data_news_ingest(symbol: str = Query(default=DEFAULT_SYMBOL, description="Símbolo (BTCUSDT)")):
-    res = ingest_sources(symbol=symbol)
-    return res
 
-@app.post("/data/sentiment/build")
-def data_sentiment_build(symbol: str = Query(default=DEFAULT_SYMBOL, description="Símbolo (BTCUSDT)")):
-    res = build_sentiment(symbol=symbol)
-    return res
+class BuildSentimentRequest(BaseModel):
+    symbol: Optional[str] = None
 
-@app.get("/data/sentiment/{symbol}")
-def data_sentiment_get(symbol: str, last_n: int = Query(default=200, ge=1, le=5000)):
-    import os, pandas as pd
-    DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-    path = os.path.join(DATA_DIR, SENTIMENT_CSV)
-    if not os.path.exists(path):
-        return {"error": f"No existe {path}. Ejecuta /data/news/ingest y /data/sentiment/build."}
-    df = pd.read_csv(path)
-    if df.empty:
-        return {"error": "Serie de sentimiento vacía."}
-    df = df.tail(last_n)
-    return {"symbol": symbol.upper(), "rows": df.to_dict(orient="records")}
 
-@app.get("/data/sentiment/drivers/{symbol}")
-def data_sentiment_drivers_get(symbol: str, last_n: int = Query(default=30, ge=1, le=500)):
-    import os, pandas as pd
-    DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-    path = os.path.join(DATA_DIR, DRIVERS_CSV)
-    if not os.path.exists(path):
-        return {"error": f"No existe {path}. Ejecuta /data/sentiment/build."}
-    df = pd.read_csv(path)
-    if df.empty:
-        return {"error": "Drivers vacío."}
-    df = df.sort_values(["date","direction"], ascending=[False, True]).head(last_n)
-    return {"symbol": symbol.upper(), "rows": df.to_dict(orient="records")}
-
+@app.post("/build/sentiment")
+def api_build_sentiment(req: BuildSentimentRequest):
+    """
+    Reconstruye la serie de sentimiento y los "drivers" (top enlaces) y los guarda:
+    - SENTIMENT_CSV (serie diaria con decaimiento)
+    - DRIVERS_CSV   (enlaces que más aportan por día)
+    """
+    try:
+        symbol = (req.symbol or DEFAULT_SYMBOL).upper()
+        out = build_sentiment(symbol=symbol, sentiment_csv=SENTIMENT_CSV, drivers_csv=DRIVERS_CSV)
+        return {"ok": True, "symbol": symbol, "files": out, "ts": _utc_now_iso()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
