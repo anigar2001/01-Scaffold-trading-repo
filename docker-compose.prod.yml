@@ -11,6 +11,8 @@ services:
     restart: unless-stopped
     depends_on:
       - redis
+    environment:
+      - PYTHONPATH=/app/src
 
   bot:
     build: .
