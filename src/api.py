@@ -269,11 +269,15 @@ def health():
 # -----------------------
 # Señal: Stockformer
 # -----------------------
+# -----------------------
+# Señal: Stockformer
+# -----------------------
 @app.post("/signal/stockformer")
 def signal_stockformer(req: StockformerSignalRequest):
     """
     Devuelve probabilidades buy/hold/sell y meta (horizon=15m por defecto).
-    Si el modelo no está disponible, realiza un fallback determinista y seguro.
+    - 1º intenta el modelo Stockformer plug-in.
+    - Si falla, usa un fallback determinista con retornos 1m (sin AISignal).
     """
     try:
         symbol = (req.symbol or "BTCUSDT").replace("/", "").upper()
@@ -281,14 +285,13 @@ def signal_stockformer(req: StockformerSignalRequest):
         if not tfs:
             tfs = ["1m", "5m", "15m", "1h"]
 
-        # Intento 1: usar el modelo Stockformer "plug-in"
+        source = "stockformer"
+        # ======= Vía principal: modelo =======
         try:
             sf = get_stockformer()
-            # La interfaz del modelo debe aceptar símbolo/TF o features; mantenemos ambos caminos.
             if req.features is not None:
-                out = sf.predict_from_features(req.features)  # esperado: {'buy':p,'hold':p,'sell':p}
+                out = sf.predict_from_features(req.features)  # {'buy':p,'hold':p,'sell':p}
             else:
-                # Cargar data mínima para construir features dentro del modelo
                 dfs = {tf: load_ohlcv_df(symbol, tf, connector) for tf in tfs}
                 out = sf.predict_from_ohlcv(dfs=dfs, horizon_min=req.horizon_min)
             probs_bhs = {
@@ -297,30 +300,30 @@ def signal_stockformer(req: StockformerSignalRequest):
                 "sell": float(out.get("sell", 0.0)),
             }
         except Exception:
-            # Intento 2: usar AISignal si está disponible
-            ai, err = get_ai()
-            if ai is not None:
-                res = ai.stockformer_signal(symbol=symbol, timeframes=tfs, horizon_min=req.horizon_min)
-                # se espera {'probs':{'buy':..,'hold':..,'sell':..}}
-                probs = res.get("probs", {})
-                probs_bhs = {
-                    "buy": float(probs.get("buy", 0.0)),
-                    "hold": float(probs.get("hold", 0.0)),
-                    "sell": float(probs.get("sell", 0.0)),
-                }
-            else:
-                raise RuntimeError(err or "AISignal no disponible")
+            # ======= Fallback determinista (sin AISignal) =======
+            source = "fallback_1m"
+            df = load_ohlcv_df(symbol, "1m", connector)
+            c = df["close"].to_numpy(dtype=np.float64)
+            r = np.diff(np.log(c))
+            if r.size < 64:
+                # acolchamos para estabilidad
+                pad = 64 - r.size
+                if pad > 0:
+                    r = np.concatenate([np.full(pad, r[0] if r.size else 0.0), r])
+            mu = float(np.mean(r[-32:]))
+            vol = float(np.std(r[-32:])) + 1e-8
+            s = mu / vol  # señal normalizada
+            # asignación suave tipo soft-sign
+            bias = float(np.tanh(3.0 * s))  # [-1,1]
+            p_buy = 0.33 + 0.33 * max(0.0, bias)
+            p_sell = 0.33 + 0.33 * max(0.0, -bias)
+            p_hold = 1.0 - (p_buy + p_sell)
+            probs_bhs = {"buy": p_buy, "hold": max(1e-9, p_hold), "sell": p_sell}
 
-        # Normaliza por seguridad
+        # Normalización defensiva
         ps = np.array([probs_bhs["sell"], probs_bhs["hold"], probs_bhs["buy"]], dtype=np.float64)
         if not np.isfinite(ps).all() or np.all(ps <= 0):
-            # Fallback duro: proporciones simples por volatilidad 1m
-            df = load_ohlcv_df(symbol, "1m", connector)
-            r = np.diff(np.log(df["close"].to_numpy()[-64:]))
-            vol = float(np.std(r)) if r.size else 1e-6
-            w_buy = float(max(0.0, np.mean(r[-16:]) / (vol + 1e-9)))
-            ps = np.array([0.25, 0.5, 0.25]) + np.array([-w_buy, 0.0, w_buy]) * 0.25
-
+            ps = np.array([0.25, 0.5, 0.25], dtype=np.float64)
         ps = np.clip(ps, 1e-9, None)
         ps = ps / ps.sum()
         probs_bhs = {"sell": float(ps[0]), "hold": float(ps[1]), "buy": float(ps[2])}
@@ -331,17 +334,19 @@ def signal_stockformer(req: StockformerSignalRequest):
             "timeframes": tfs,
             "ts": _utc_now_iso(),
             "model_path": STOCKFORMER_MODEL_FILE,
+            "source": source,
         }
         return {
             "signal": label,
             "confidence_pct": conf_pct,
-            "probs": _probs_to_table_keys(probs_bhs),
+            "probs": _probs_to_table_keys(probs_bhs),  # "-1","0","1"
             "meta": meta,
         }
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 # -----------------------
