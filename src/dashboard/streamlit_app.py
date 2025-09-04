@@ -607,14 +607,40 @@ c1, c2 = st.columns(2)
 with c1:
     st.caption("POST /signal/stockformer")
     if st.button("Probar Stockformer (POST)"):
-        payload = {"symbol": SYMBOL, "timeframes": ["1m","5m","15m","1h"], "features": {"1m":[], "5m":[], "15m":[], "1h":[]}}
-        st.json(requests.post(f"{API_BASE}/signal/stockformer", json=payload, timeout=8).json())
+        payload = {"symbol": SYMBOL, "timeframes": ["1m", "5m", "15m", "1h"], "horizon_min": 15}
+        st.json(requests.post(f"{API_BASE}/signal/stockformer", json=payload, timeout=12).json())
+
 
 with c2:
     st.caption("POST /agent/multimodal/action")
+
+    # Cuántas velas 1m enviar al agente RL (>= 175 recomendado)
+    N = st.slider("Velas 1m para RL", min_value=175, max_value=1000, value=400, step=25, key="rl_n")
+
+    # Sentimiento (si no lo tienes calculado aún, 0.0 es neutral)
+    sent_value = st.number_input("Sentimiento (−1..+1)", min_value=-1.0, max_value=1.0, value=0.0, step=0.05, key="rl_sent")
+
     if st.button("Probar RL Multimodal (POST)"):
-        payload = {"symbols":[SYMBOL], "price_window":[[100,100.2,100.1,100.6,100.9]], "sentiment": 0.2}
-        st.json(requests.post(f"{API_BASE}/agent/multimodal/action", json=payload, timeout=8).json())
+        # 1) Tomamos las últimas N velas 1m. Preferimos df_1m ya cargado.
+        prices: list[float] = []
+        try:
+            if df_1m is not None and not df_1m.empty:
+                prices = df_1m["close"].tail(N).astype(float).tolist()
+            else:
+                # Fallback: leer del CSV directo
+                csv_1m = os.path.join(DATA_DIR, f"ohlcv_{SYMBOL}_1m.csv")
+                tmp = pd.read_csv(csv_1m, usecols=["close"])
+                prices = tmp["close"].tail(N).astype(float).tolist()
+        except Exception as e:
+            st.error(f"No pude preparar precios 1m: {e}")
+
+        payload = {"symbols": [SYMBOL], "price_window": [prices], "sentiment": float(sent_value)}
+        try:
+            res = requests.post(f"{API_BASE}/agent/multimodal/action", json=payload, timeout=12).json()
+            st.write(f"n_prices={len(prices)} · len(positions_hist)={len(res.get('positions_hist',[]))} · len(equity_curve)={len(res.get('equity_curve',[]))}")
+            st.json(res)
+        except Exception as e:
+            st.error(f"Fallo llamando al endpoint RL: {e}")
 
 st.subheader("🧰 Noticias & Sentimiento — acciones rápidas")
 c1, c2, c3 = st.columns([1,1,2])
